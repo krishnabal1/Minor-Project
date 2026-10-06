@@ -1,11 +1,5 @@
 # MNIST privacy-preserving federated learning
 
-This project implements a runnable, paper-inspired MNIST experiment based on
-Gupta, Kumar, and Dhir, “Privacy-preserving federated learning in asynchronous
-environment using homomorphic encryption,” *Journal of Information Security
-and Applications*, 93 (2025), 104116
-([doi:10.1016/j.jisa.2025.104116](https://doi.org/10.1016/j.jisa.2025.104116)).
-The paper PDF is [RP PPFRL mohit.pdf](./RP%20PPFRL%20mohit.pdf).
 
 ## Run
 

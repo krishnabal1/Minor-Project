@@ -1,0 +1,301 @@
+MNIST PRIVACY-PRESERVING FEDERATED LEARNING
+Detailed implementation guide and paper comparison
+
+PROJECT FILES
+------------
+main.py        The training experiment: data preparation, CNN, clients,
+               quantization, Paillier encryption, aggregation, evaluation,
+               and CSV metrics.
+download.py    Loads/checks the MNIST dataset in the TensorFlow/Keras cache.
+requirements.txt  Python package dependencies.
+test_main.py   Focused tests for non-IID partitioning, quantization, and
+               encrypted averaging.
+README.md      Short installation and run instructions.
+workflow.png  Overview of the implemented execution flow.
+RP PPFRL mohit.pdf
+               The paper used as a reference.
+
+Lines below refer to main.py unless another filename is explicitly given.
+Line references describe the source as delivered with this report.
+
+
+1. WHAT THE PROGRAM DOES, IN SIMPLE WORDS
+------------------------------------------
+The program trains one shared handwritten-digit classifier without collecting
+all client images into one training pool. It divides MNIST training examples
+among three simulated clients. Each client starts a round with the same current
+global model, trains on its own examples, and calculates how much its model
+weights changed. The changes are clipped and converted to small signed integer
+values. Each client's integer update is packed and encrypted with Paillier.
+
+The server adds encrypted client updates without first decrypting each client's
+individual update. In this single-computer simulation, the server then decrypts
+the combined values, averages them, applies the average change to the global
+model, tests the model on the MNIST test set, and starts the next round. The
+program records per-round measurements in a CSV file.
+
+This is a research/learning implementation, not a production privacy system.
+The clients, server, and decryption key all run in the same process. The
+configured client delays are simulated values, not real network or training
+completion times.
+
+
+2. FLOW DIAGRAM
+---------------
+Open workflow.png for a visual overview. In words, the flow is:
+
+MNIST -> normalize and split into client shards -> initialize global CNN ->
+each round: send current global weights to eligible clients -> local training
+-> compute client weight changes -> clip and 8-bit quantize -> pack and
+Paillier-encrypt -> add encrypted updates -> decrypt and average the aggregate
+-> update global model -> test and record metrics -> next round -> CSV results.
+
+
+3. DATA: HOW THE NON-IID SPLIT IS MADE
+-------------------------------------
+The full Keras MNIST training set has 60,000 labeled examples. Images are
+normalized to values from 0 to 1 and given a single grayscale channel. Test
+images and labels are kept separately for evaluation. This loading and
+preprocessing is in main.py lines 178-187.
+
+The split function is partition_non_iid in main.py lines 34-53:
+
+  1. There are three clients (main.py line 18).
+  2. The function sorts the training-example indices by their digit label
+     (line 47). This brings similar digits together in the sorted list.
+  3. It divides that sorted list into 30 consecutive pieces: 10 shards per
+     client (lines 40 and 48). With all 60,000 training examples, each shard
+     has 2,000 examples and each client receives 10 shards, or 20,000
+     examples.
+  4. It shuffles the 30 shards using the supplied random seed (line 49).
+  5. It assigns every third shard to each client (lines 50-52). The clients
+     each receive the same number of examples, but the digit mix in their
+     shards can differ. This is label-skewed/non-IID partitioning.
+
+This is not a guarantee that each client has only one or two digit classes.
+The three shards for each digit are shuffled across clients, so clients may
+receive different amounts of each digit. It is a reproducible label-skew
+simulation, not a fully specified or measured statistical distribution.
+The seed is set in main.py lines 203-205.
+
+For a quick run, --max-train-samples first randomly selects a smaller subset
+of the training set before partitioning (main.py lines 189-197). It does not
+shrink the MNIST test set.
+
+PAPER SPLIT CAVEAT: The paper is inconsistent about this choice. Its evaluation
+setup (Section 6.1, printed page 11) says it uses non-IID training data, but
+the following description says IID partitioning shuffles data and divides it
+evenly among three clients. This implementation chooses label-skewed non-IID
+data, following the evaluation setup statement. Its exact shard recipe is an
+implementation choice; it is not stated as the paper's exact split algorithm.
+
+
+4. MODEL AND LOCAL CLIENT TRAINING
+----------------------------------
+The CNN is defined and compiled by create_model in main.py lines 157-175. It
+has two convolution/max-pooling stages, a 32-unit dense layer, and a 10-unit
+digit output. It uses SGD at learning rate 0.01, sparse categorical
+cross-entropy, and accuracy.
+
+At the start of each round, the global model's weights are copied
+(main.py lines 229-233). For each simulated client whose configured delay is
+not greater than the round timer, the program creates a fresh CNN and loads
+those same global weights (lines 235-243). That client then trains the CNN
+only on its own local images and labels (lines 243-250). The image data itself
+does not get sent to the server.
+
+After local training, the client computes the difference between its trained
+weights and the round's starting global weights (main.py lines 251-259). This
+difference is called a model update or model delta. The client update is
+quantized and marked as received (line 260-261).
+
+All accepted clients start the round from the same global model. Their updates
+are averaged with equal client weight, not weighted by each client's number
+of examples. The full default split is equal-sized, but using a small subset
+can make client sizes differ by a few examples. The current aggregation still
+weights clients equally in that case.
+
+The default local epoch count is 1 (main.py line 351), to make an initial run
+more practical on a CPU. The paper's Table 5 appears to list 20 local epochs,
+20 federated rounds, three clients, batch size 32, learning rate 0.01,
+quantization bits 8, initial timer 10, and timer increment 5. The code defaults
+to 20 rounds, batch size 32, learning rate 0.01, 8-bit quantization, timer 10,
+and timer increment 5 (main.py lines 350-356), but it does NOT default to the
+paper's 20 local epochs. Pass --local-epochs 20 to use that apparent paper
+setting. The paper's CNN architecture is not specified well enough to claim
+that this implementation's layer sizes are an exact reproduction.
+
+
+5. CLIENT DELAYS AND ASYNCHRONOUS BEHAVIOR
+------------------------------------------
+The initial timer is 10 seconds by default and rises by 5 after each round
+(main.py lines 355-356 and 332). The default simulated client delays are 2,
+6, and 12 (main.py lines 357-362). A client is eligible when its configured
+delay is no greater than the current timer (lines 235-240).
+
+With those defaults, the first round accepts the clients with delays 2 and 6,
+but drops the client with delay 12. After the timer increases, the second
+round's 15-second deadline accepts all three; later deadlines also accept
+them. If no client meets a round deadline, training stops with an explicit
+error (main.py lines 263-267).
+
+IMPORTANT: This is an asynchronous/straggler simulation, not a distributed
+asynchronous implementation. The delay numbers are eligibility thresholds:
+the code does not actually sleep for those delays, start client workers in
+parallel, or receive network messages over time. Eligible clients' training
+is executed sequentially by one Python process inside the loop. It models
+which updates arrive before a deadline; it does not measure real network
+latency or reproduce actual parallel scheduling.
+
+
+6. HOW UPDATES MOVE THROUGH FEDERATED LEARNING
+----------------------------------------------
+Federated learning here means the raw training images stay in the local
+training step, while model changes, rather than images, are used to update the
+shared model.
+
+Update preparation:
+  - A client subtracts the starting global weights from its trained local
+    weights (main.py lines 251-260).
+  - quantize_update clips each delta value to [-clip_value, +clip_value],
+    scales it, and rounds it to one of 255 signed integer values from -127
+    through +127 (main.py lines 23-31). The default clip value is 1.0
+    (line 354). Clipping limits large values; quantization reduces precision.
+
+Encryption and encrypted aggregation:
+  - The program makes a fresh Paillier key pair for each round
+    (main.py lines 269-272).
+  - encrypt_packed_updates validates the quantized values, packs several
+    integer values into each plaintext integer, encrypts each client's packed
+    value, and adds the ciphertexts together (main.py lines 56-109).
+    Paillier's additive property allows those ciphertext additions without
+    decrypting each client's individual update.
+  - The plaintext packing uses a bit width chosen to prevent carries between
+    adjacent packed values when the participating clients' values are summed
+    (main.py lines 86-107). The unit test checks the decoded encrypted average.
+
+Aggregate and global model:
+  - decrypt_packed_average decrypts each encrypted sum and extracts the
+    individual summed slots, then divides by the number of accepted clients
+    (main.py lines 112-154).
+  - run_experiment converts the integer average back to a floating-point
+    update, adds it to the global weights, and installs the new weights
+    (main.py lines 278-299).
+  - This implementation decrypts at the simulated server to apply the
+    aggregate. It does not transmit an encrypted aggregate back to clients
+    for client-side decryption.
+
+The implementation uses standard additive Paillier from the phe package.
+It does NOT implement the paper's custom/improved Paillier equations or
+threshold decryption. The paper's key-sharing/decryption descriptions and
+equations are not complete enough to safely treat the single-process key
+handling here as an exact cryptographic reproduction.
+
+
+7. TESTING, OUTPUT METRICS, AND RUN COMMANDS
+--------------------------------------------
+After each round, main.py evaluates the global model against all 10,000 MNIST
+test examples (lines 301-303). It records accuracy, loss, accepted client
+count, timer, measured key-generation/encryption time, measured aggregate
+decryption time, round wall-clock duration, an estimated communication byte
+count, key length, and quantization precision (lines 304-322). It prints a
+round summary (lines 323-330) and writes the rows to CSV (lines 334-341).
+The default CSV path is results/mnist_ppfrl_results.csv (main.py line 366).
+
+Communication bytes are an estimate computed from the number of packed
+ciphertexts and their approximate size, multiplied by accepted clients plus
+one (main.py lines 304-308). This code does not send or capture network
+packets. Consequently this estimate is not a measured network transfer and
+should not be compared directly to a real network traffic measurement.
+
+Quick smoke run:
+  python main.py --rounds 1 --max-train-samples 90 --client-delays 0 0 0 --initial-timer 0
+
+Full default run (may take a long time on CPU):
+  python main.py
+
+Closer local-epoch setting from paper Table 5:
+  python main.py --local-epochs 20
+
+Dependencies and data preparation:
+  python -m pip install -r requirements.txt
+  python download.py
+
+Focused checks:
+  python -m unittest test_main.py
+
+The source tests are in test_main.py: they check 8-bit clipping/quantization,
+Paillier packed encrypted averaging, rejection of overflow-range inputs, and
+complete/reproducible non-IID shard assignment.
+
+
+8. RESULTS: IMPLEMENTATION VERSUS PAPER
+---------------------------------------
+PAPER-REPORTED MNIST RESULT
+  The paper reports an average MNIST test accuracy of 94.77% for its
+  experiments (Section 6.2.1, printed page 11). It describes 20 federated
+  rounds using a CNN and three clients. Its Table 5 appears to specify 20
+  local epochs, batch size 32, learning rate 0.01, 8-bit quantization, and
+  timer parameters 10 and 5.
+
+  For communication, the paper later gives totals over 20 iterations of
+  929 GB for the baseline MNIST setting and 87 GB for its proposed setting
+  (Section 6.2.3, printed page 12-13). Taken literally, those figures imply
+  about a 90.6% lower proposed total (1 - 87/929).
+
+  The abstract associates a 12.46% reduction with MNIST and CIFAR-10 and
+  14.72% with Fashion-MNIST when discussing total training time and
+  communication cost, but it does not clearly separate those percentages by
+  metric. The 12.46% headline also does not match the 929-to-87 GB totals as
+  a communication reduction. Treat these as paper-reported claims with an
+  internal reporting ambiguity, not as numbers reproduced by this code.
+
+IMPLEMENTATION RESULT ACTUALLY MEASURED
+  The final smoke run used only 90 training examples, one local epoch, one
+  round, a zero-second simulated deadline, and zero delay for all three
+  clients. It completed encryption and aggregation, accepted all three
+  clients, and reported test accuracy about 11.34% and loss about 2.308 on
+  the 10,000-image test set. This tiny one-round smoke-test result is only
+  evidence that the pipeline runs. It is not a meaningful trained-model
+  score and is not comparable to the paper's 94.77%.
+
+  A separate smoke run with 600 training examples also completed a round and
+  reported 12.50% test accuracy. It is likewise only a pipeline check.
+
+  The complete default 20-round run on all 60,000 MNIST training images was
+  started but took too long on this native-Windows, CPU-only TensorFlow
+  environment and was stopped. Therefore there is currently NO measured
+  full-run accuracy, training-time comparison, or comparable end-to-end
+  communication result for this implementation. The code and report do not
+  claim that this implementation achieves the paper's accuracy or speedup.
+
+SIDE-BY-SIDE SUMMARY
+  Measure                  Paper                        Current implementation
+  -----------------------  ---------------------------  ---------------------------
+  Dataset                  MNIST among others           MNIST only
+  Clients                  3                            3 simulated clients
+  Data distribution        Says non-IID, but also       Label-sorted 30-shard
+                           describes IID partitioning   non-IID assignment
+  Model                    CNN                          CNN; exact layers chosen here
+  Federated rounds         20                           Default 20
+  Local epochs             Table appears to say 20      Default 1; configurable to 20
+  Batch size               32                           32
+  Learning rate            0.01                         0.01
+  Quantization             8 bit                        Signed 8-bit update values
+  Encryption               Improved Paillier            Standard additive Paillier
+  Asynchronous timing      Adaptive timer               Simulated delay/deadline gate;
+                                                        clients actually run sequentially
+  MNIST accuracy           94.77% reported              No full-run result measured
+  Smoke accuracy           Not comparable               11.34% on 90 examples/1 round
+  MNIST traffic            929 GB baseline;             Estimate formula in CSV;
+                           87 GB proposed (paper)        no real network transfer
+
+BOTTOM LINE
+  The core experimental flow has been implemented and tested on small smoke
+  runs, including non-IID client partitions and actual Paillier encryption
+  and homomorphic ciphertext addition. It is a transparent, runnable
+  paper-inspired prototype. It is not a completed numerical reproduction of
+  the paper: its full training result has not been measured; its client
+  schedule is simulated; it uses a chosen CNN architecture; its default local
+  epoch count differs from the paper's apparent setting; and it uses standard
+  rather than the paper's claimed improved Paillier variant.

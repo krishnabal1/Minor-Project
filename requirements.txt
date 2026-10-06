@@ -1,0 +1,3 @@
+tensorflow>=2.16
+numpy>=1.26
+phe>=1.5.0
